@@ -18,6 +18,9 @@
 (define-constant err-already-exists (err u103))
 (define-constant err-insufficient-balance (err u104))
 
+;; Add to constants
+(define-constant referral-reward u100)
+
 ;; data vars
 (define-data-var service-count uint u0)
 
@@ -38,6 +41,14 @@
 (define-map service-usage { user: principal, service-id: uint } uint)
 
 (define-map citizen-balances principal uint)
+
+;; Add to data maps section
+(define-map service-ratings { service-id: uint, user: principal } uint)
+(define-map service-rating-stats uint { total-ratings: uint, sum-ratings: uint })
+
+;; Add to data maps section
+(define-map referrals { referrer: principal, referred: principal } bool)
+(define-map referral-counts principal uint)
 
 ;; public functions
 
@@ -128,6 +139,53 @@
   )
 )
 
+(define-public (rate-service (service-id uint) (rating uint))
+    (let (
+        (service (unwrap! (map-get? services service-id) err-not-found))
+        (current-stats (default-to { total-ratings: u0, sum-ratings: u0 } 
+                        (map-get? service-rating-stats service-id)))
+    )
+        (asserts! (and (>= rating u1) (<= rating u5)) (err u300))
+        (map-set service-ratings { service-id: service-id, user: tx-sender } rating)
+        (map-set service-rating-stats service-id {
+            total-ratings: (+ (get total-ratings current-stats) u1),
+            sum-ratings: (+ (get sum-ratings current-stats) rating)
+        })
+        (ok true)
+    )
+)
+
+(define-public (subscribe-with-referral (service-id uint) (referrer principal))
+    (let (
+        (service (unwrap! (map-get? services service-id) err-not-found))
+        (user-balance (default-to u0 (map-get? citizen-balances tx-sender)))
+        (price (get price service))
+        (current-block-height stacks-block-height)
+        (subscription-period u1440)
+    )
+        (asserts! (not (is-eq tx-sender referrer)) (err u400))
+        (asserts! (get active service) err-unauthorized)
+        (asserts! (>= user-balance price) err-insufficient-balance)
+        
+        ;; Process referral
+        (map-set referrals { referrer: referrer, referred: tx-sender } true)
+        (map-set referral-counts referrer 
+            (+ (default-to u0 (map-get? referral-counts referrer)) u1))
+        
+        ;; Add referral bonus
+        (map-set citizen-balances referrer 
+            (+ (default-to u0 (map-get? citizen-balances referrer)) referral-reward))
+        
+        ;; Regular subscription process
+        (map-set citizen-balances tx-sender (- user-balance price))
+        (map-set subscriptions { user: tx-sender, service-id: service-id } {
+            expiry: (+ current-block-height subscription-period),
+            active: true
+        })
+        (ok true)
+    )
+)
+
 ;; read only functions
 (define-read-only (get-service (service-id uint))
   (map-get? services service-id)
@@ -158,4 +216,103 @@
   )
 )
 
+(define-read-only (get-service-rating (service-id uint))
+    (let (
+        (stats (default-to { total-ratings: u0, sum-ratings: u0 } 
+                (map-get? service-rating-stats service-id)))
+    )
+        (if (is-eq (get total-ratings stats) u0)
+            u0
+            (/ (get sum-ratings stats) (get total-ratings stats))
+        )
+    )
+)
 
+
+;; Add to data maps section
+(define-map emergency-access principal bool)
+(define-map priority-requests { user: principal, service-id: uint } uint)
+
+;; Add these public functions
+(define-public (grant-emergency-access (user principal))
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (map-set emergency-access user true)
+        (ok true)
+    )
+)
+
+(define-public (request-priority-service (service-id uint))
+    (let (
+        (is-emergency (default-to false (map-get? emergency-access tx-sender)))
+        (current-requests (default-to u0 
+            (map-get? priority-requests { user: tx-sender, service-id: service-id })))
+    )
+        (asserts! is-emergency (err u500))
+        (map-set priority-requests { user: tx-sender, service-id: service-id } 
+            (+ current-requests u1))
+        (ok true)
+    )
+)
+
+
+;; Add to data maps section
+(define-map maintenance-schedule uint {
+    service-id: uint,
+    start-block: uint,
+    end-block: uint,
+    description: (string-ascii 200)
+})
+(define-data-var maintenance-count uint u0)
+
+;; Add these public functions
+(define-public (schedule-maintenance 
+    (service-id uint) 
+    (start-block uint) 
+    (end-block uint) 
+    (description (string-ascii 200)))
+    (let (
+        (service (unwrap! (map-get? services service-id) err-not-found))
+        (maintenance-id (var-get maintenance-count))
+    )
+        (asserts! (is-eq tx-sender (get provider service)) err-unauthorized)
+        (asserts! (> start-block stacks-block-height) (err u600))
+        (asserts! (> end-block start-block) (err u601))
+        
+        (map-set maintenance-schedule maintenance-id {
+            service-id: service-id,
+            start-block: start-block,
+            end-block: end-block,
+            description: description
+        })
+        (var-set maintenance-count (+ maintenance-id u1))
+        (ok maintenance-id)
+    )
+)
+
+
+;; Add to data maps section
+(define-map service-feedback { service-id: uint, user: principal } {
+    comment: (string-ascii 500),
+    timestamp: uint
+})
+
+;; Add this public function
+(define-public (submit-feedback (service-id uint) (comment (string-ascii 500)))
+    (let (
+        (service (unwrap! (map-get? services service-id) err-not-found))
+        (subscription (unwrap! (map-get? subscriptions 
+            { user: tx-sender, service-id: service-id }) err-unauthorized))
+    )
+        (asserts! (get active subscription) err-unauthorized)
+        (map-set service-feedback { service-id: service-id, user: tx-sender } {
+            comment: comment,
+            timestamp: stacks-block-height
+        })
+        (ok true)
+    )
+)
+
+(define-read-only (get-feedback (service-id uint) (user principal))
+    (map-get? service-feedback { service-id: service-id, user: user })
+)
