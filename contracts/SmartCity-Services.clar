@@ -228,6 +228,12 @@
     )
 )
 
+(define-read-only (get-service-price (service-id uint))
+    (let ((service (unwrap! (map-get? services service-id) err-not-found)))
+        (ok (get price service))
+    )
+)
+
 
 ;; Add to data maps section
 (define-map emergency-access principal bool)
@@ -315,4 +321,88 @@
 
 (define-read-only (get-feedback (service-id uint) (user principal))
     (map-get? service-feedback { service-id: service-id, user: user })
+)
+
+
+(define-map service-bundles uint {
+    name: (string-ascii 50),
+    services: (list 10 uint),
+    discount-percent: uint,
+    active: bool
+})
+
+(define-data-var bundle-count uint u0)
+
+(define-public (create-service-bundle (name (string-ascii 50)) (service-ids (list 10 uint)) (discount uint))
+    (let ((bundle-id (var-get bundle-count)))
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (asserts! (and (>= discount u0) (<= discount u100)) (err u700))
+        (map-set service-bundles bundle-id {
+            name: name,
+            services: service-ids,
+            discount-percent: discount,
+            active: true
+        })
+        (var-set bundle-count (+ bundle-id u1))
+        (ok bundle-id)
+    )
+)
+
+(define-private (subscribe-user (service-id uint))
+    (let (
+        (current-block-height stacks-block-height)
+        (subscription-period u1440)
+    )
+        (map-set subscriptions { user: tx-sender, service-id: service-id } {
+            expiry: (+ current-block-height subscription-period),
+            active: true
+        })
+    )
+)
+
+(define-public (subscribe-to-bundle (bundle-id uint))
+    (let (
+        (bundle (unwrap! (map-get? service-bundles bundle-id) err-not-found))
+        ;; TODO: Check if user is already subscribed to any service in the bundle
+        (total-price  u0)
+        (discounted-price (- total-price (* total-price (/ (get discount-percent bundle) u100))))
+    )
+        (asserts! (get active bundle) err-unauthorized)
+        (asserts! (>= (get-balance tx-sender) discounted-price) err-insufficient-balance)
+        (map-set citizen-balances tx-sender (- (get-balance tx-sender) discounted-price))
+        (map subscribe-user (get services bundle))
+        (ok true)
+    )
+)
+
+
+(define-map user-points principal uint)
+(define-constant points-per-use u10)
+(define-constant points-threshold u1000)
+(define-constant reward-amount u50)
+
+(define-public (claim-usage-rewards)
+    (let (
+        (user-point-balance (default-to u0 (map-get? user-points tx-sender)))
+    )
+        (asserts! (>= user-point-balance points-threshold) err-insufficient-balance)
+        (map-set user-points tx-sender (- user-point-balance points-threshold))
+        (map-set citizen-balances tx-sender 
+            (+ (default-to u0 (map-get? citizen-balances tx-sender)) reward-amount))
+        (ok true)
+    )
+)
+
+(define-public (award-service-points (service-id uint))
+    (let (
+        (current-points (default-to u0 (map-get? user-points tx-sender)))
+    )
+        (asserts! (is-subscription-active tx-sender service-id) err-unauthorized)
+        (map-set user-points tx-sender (+ current-points points-per-use))
+        (ok true)
+    )
+)
+
+(define-read-only (get-user-points (user principal))
+    (default-to u0 (map-get? user-points user))
 )
