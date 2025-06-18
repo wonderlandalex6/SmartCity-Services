@@ -10,6 +10,38 @@
   )
 )
 
+
+(define-map service-sla uint {
+    uptime-guarantee: uint,
+    response-time-limit: uint,
+    compensation-rate: uint,
+    monitoring-enabled: bool
+})
+
+(define-map service-performance uint {
+    total-requests: uint,
+    successful-requests: uint,
+    total-response-time: uint,
+    last-updated: uint,
+    violations: uint
+})
+
+(define-map sla-violations { service-id: uint, violation-id: uint } {
+    user: principal,
+    violation-type: (string-ascii 20),
+    timestamp: uint,
+    compensation-amount: uint,
+    resolved: bool
+})
+
+(define-data-var violation-count uint u0)
+
+(define-constant sla-violation-uptime "uptime")
+(define-constant sla-violation-response "response_time")
+(define-constant min-uptime-percent u95)
+(define-constant max-response-time u100)
+(define-constant default-compensation u10)
+
 ;; constants
 (define-constant contract-owner tx-sender)
 (define-constant err-owner-only (err u100))
@@ -405,4 +437,148 @@
 
 (define-read-only (get-user-points (user principal))
     (default-to u0 (map-get? user-points user))
+)
+
+
+(define-public (set-service-sla (service-id uint) (uptime-guarantee uint) (response-time-limit uint) (compensation-rate uint))
+    (let ((service (unwrap! (map-get? services service-id) err-not-found)))
+        (asserts! (is-eq tx-sender (get provider service)) err-unauthorized)
+        (asserts! (and (>= uptime-guarantee u90) (<= uptime-guarantee u100)) (err u800))
+        (asserts! (> response-time-limit u0) (err u801))
+        (asserts! (> compensation-rate u0) (err u802))
+        
+        (map-set service-sla service-id {
+            uptime-guarantee: uptime-guarantee,
+            response-time-limit: response-time-limit,
+            compensation-rate: compensation-rate,
+            monitoring-enabled: true
+        })
+        (ok true)
+    )
+)
+
+
+(define-private (create-sla-violation (service-id uint) (violation-type (string-ascii 20)) (compensation uint))
+    (let (
+        (violation-id (var-get violation-count))
+        (current-perf (unwrap-panic (map-get? service-performance service-id)))
+    )
+        (map-set sla-violations { service-id: service-id, violation-id: violation-id } {
+            user: tx-sender,
+            violation-type: violation-type,
+            timestamp: stacks-block-height,
+            compensation-amount: compensation,
+            resolved: false
+        })
+        
+        (map-set service-performance service-id (merge current-perf {
+            violations: (+ (get violations current-perf) u1)
+        }))
+        
+        (var-set violation-count (+ violation-id u1))
+        (ok violation-id)
+    )
+)
+
+(define-public (claim-sla-compensation (service-id uint) (violation-id uint))
+    (let (
+        (violation (unwrap! (map-get? sla-violations { service-id: service-id, violation-id: violation-id }) err-not-found))
+        (subscription (unwrap! (map-get? subscriptions { user: tx-sender, service-id: service-id }) err-unauthorized))
+    )
+        (asserts! (not (get resolved violation)) (err u803))
+        (asserts! (get active subscription) err-unauthorized)
+        
+        (map-set sla-violations { service-id: service-id, violation-id: violation-id } 
+            (merge violation { resolved: true }))
+        
+        (map-set citizen-balances tx-sender 
+            (+ (default-to u0 (map-get? citizen-balances tx-sender)) (get compensation-amount violation)))
+        
+        (ok true)
+    )
+)
+
+(define-public (resolve-sla-violation (service-id uint) (violation-id uint))
+    (let (
+        (service (unwrap! (map-get? services service-id) err-not-found))
+        (violation (unwrap! (map-get? sla-violations { service-id: service-id, violation-id: violation-id }) err-not-found))
+    )
+        (asserts! (is-eq tx-sender (get provider service)) err-unauthorized)
+        (asserts! (not (get resolved violation)) (err u803))
+        
+        (map-set citizen-balances (get user violation)
+            (+ (default-to u0 (map-get? citizen-balances (get user violation))) (get compensation-amount violation)))
+        
+        (map-set sla-violations { service-id: service-id, violation-id: violation-id }
+            (merge violation { resolved: true }))
+        
+        (ok true)
+    )
+)
+
+(define-read-only (get-service-sla (service-id uint))
+    (map-get? service-sla service-id)
+)
+
+(define-read-only (get-service-performance (service-id uint))
+    (map-get? service-performance service-id)
+)
+
+(define-read-only (get-service-uptime (service-id uint))
+    (let ((perf (map-get? service-performance service-id)))
+        (if (is-some perf)
+            (let ((performance (unwrap-panic perf)))
+                (if (> (get total-requests performance) u0)
+                    (some (/ (* (get successful-requests performance) u100) (get total-requests performance)))
+                    (some u100)
+                )
+            )
+            none
+        )
+    )
+)
+
+(define-read-only (get-average-response-time (service-id uint))
+    (let ((perf (map-get? service-performance service-id)))
+        (if (is-some perf)
+            (let ((performance (unwrap-panic perf)))
+                (if (> (get total-requests performance) u0)
+                    (some (/ (get total-response-time performance) (get total-requests performance)))
+                    (some u0)
+                )
+            )
+            none
+        )
+    )
+)
+
+(define-read-only (get-sla-violation (service-id uint) (violation-id uint))
+    (map-get? sla-violations { service-id: service-id, violation-id: violation-id })
+)
+
+(define-read-only (check-sla-compliance (service-id uint))
+    (let (
+        (sla (map-get? service-sla service-id))
+        (uptime (get-service-uptime service-id))
+        (avg-response (get-average-response-time service-id))
+    )
+        (if (and (is-some sla) (is-some uptime) (is-some avg-response))
+            (let (
+                (sla-terms (unwrap-panic sla))
+                (current-uptime (unwrap-panic uptime))
+                (current-response (unwrap-panic avg-response))
+            )
+                {
+                    uptime-compliant: (>= current-uptime (get uptime-guarantee sla-terms)),
+                    response-compliant: (<= current-response (get response-time-limit sla-terms)),
+                    monitoring-enabled: (get monitoring-enabled sla-terms)
+                }
+            )
+            {
+                uptime-compliant: true,
+                response-compliant: true,
+                monitoring-enabled: false
+            }
+        )
+    )
 )
